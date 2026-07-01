@@ -1,0 +1,17 @@
+[project]
+name = "favsandmarks"
+version = "0.1.0"
+description = "Bluesky likes and bookmarks served as RSS feeds via FastAPI."
+requires-python = ">=3.14"
+dependencies = [
+    "atproto>=0.0.69",
+    "fastapi>=0.138.2",
+    "python-dotenv>=1.2.2",
+    "uvicorn>=0.49.0",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.1.1",
+]
