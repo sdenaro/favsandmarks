@@ -13,7 +13,7 @@ A lightweight FastAPI service that exposes your Bluesky likes and bookmarks as R
 
 ## Prerequisites
 
-- Python 3.14+
+- Python 3.10+
 - [uv](https://docs.astral.sh/uv/) package manager
 
 ## Setup
@@ -51,8 +51,8 @@ A lightweight FastAPI service that exposes your Bluesky likes and bookmarks as R
    | `BLUESKY_HANDLE` | Yes | Your default Bluesky handle |
    | `BLUESKY_APP_PASSWORD` | Yes | App password for the default account |
    | `LIMIT` | No | Default number of items returned (1–25, defaults to 10). Values outside this range are clamped. |
-   | `NAME_BLUESKY_HANDLE` | No | Bluesky handle for an additional account (selected via `?username=name`) |
-   | `NAME_BLUESKY_APP_PASSWORD` | No | App password for the additional account |
+   | `<NAME>_BLUESKY_HANDLE` | No | Bluesky handle for an additional account (selected via `?username=<name>`) |
+   | `<NAME>_BLUESKY_APP_PASSWORD` | No | App password for the additional account |
 
    You can generate an app password at [bsky.app/settings/app-passwords](https://bsky.app/settings/app-passwords).
 
@@ -78,7 +78,7 @@ All feed endpoints accept these optional query parameters:
 | Parameter | Description |
 |-----------|-------------|
 | `?limit=N` | Number of items to return (1–25). Defaults to the `LIMIT` env var or 10. |
-| `?username=NAME` | Use alternate account credentials (`NAME_BLUESKY_HANDLE` / `NAME_BLUESKY_APP_PASSWORD` from `.env`). The name is case-insensitive. |
+| `?username=<name>` | Use alternate account credentials (`<NAME>_BLUESKY_HANDLE` / `<NAME>_BLUESKY_APP_PASSWORD` from `.env`). The name is case-insensitive. |
 
 Examples:
 
