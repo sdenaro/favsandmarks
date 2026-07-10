@@ -448,8 +448,8 @@ def root():
     return {
         "app": "FavsAndMarks",
         "endpoints": {
-            "/fav": "Liked posts as RSS (?limit=1..25, ?username=NAME)",
-            "/marks": "Bookmarked posts as RSS (?limit=1..25, ?username=NAME)",
-            "/combo": "Likes & bookmarks combined as RSS (?limit=1..25, ?username=NAME)",
+            "/fav": "Liked posts as RSS (?limit=1..25, ?username=<name>)",
+            "/marks": "Bookmarked posts as RSS (?limit=1..25, ?username=<name>)",
+            "/combo": "Likes & bookmarks combined as RSS (?limit=1..25, ?username=<name>)",
         },
     }
