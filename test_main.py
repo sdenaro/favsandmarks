@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
-from main import DEFAULT_LIMIT, app, build_rss, extract_media, get_client
+from main import DEFAULT_LIMIT, app, build_rss, extract_external_link, extract_media, extract_quote, get_client
 from fastapi import HTTPException
 
 # ---------------------------------------------------------------------------
@@ -75,6 +75,69 @@ def _make_record_with_media_embed(inner_embed):
     return SimpleNamespace(
         py_type="app.bsky.embed.recordWithMedia#view",
         media=inner_embed,
+    )
+
+
+def _make_record_embed(
+    text="Quoted post",
+    handle="quoteduser.bsky.social",
+    display_name="Quoted User",
+    uri="at://did:plc:quoted/app.bsky.feed.post/q1",
+    embeds=None,
+):
+    """Build a quote-post embed (app.bsky.embed.record#view)."""
+    return SimpleNamespace(
+        py_type="app.bsky.embed.record#view",
+        record=SimpleNamespace(
+            py_type="app.bsky.embed.record#viewRecord",
+            uri=uri,
+            author=SimpleNamespace(handle=handle, display_name=display_name),
+            value=SimpleNamespace(text=text),
+            embeds=embeds or [],
+        ),
+    )
+
+
+def _make_full_external_embed(
+    uri="https://example.com",
+    title="Example",
+    description="An example link",
+    thumb_url=None,
+):
+    """Build an external embed with full metadata (uri, title, description)."""
+    return SimpleNamespace(
+        py_type="app.bsky.embed.external#view",
+        external=SimpleNamespace(
+            uri=uri,
+            title=title,
+            description=description,
+            thumb=thumb_url,
+        ),
+    )
+
+
+def _make_record_with_media_full_embed(
+    media_embed,
+    record_text="Quoted",
+    record_handle="q.bsky.social",
+    record_name="Q",
+    record_uri="at://did:plc:q/app.bsky.feed.post/q1",
+    record_embeds=None,
+):
+    """Build a recordWithMedia embed with a full quoted record."""
+    return SimpleNamespace(
+        py_type="app.bsky.embed.recordWithMedia#view",
+        media=media_embed,
+        record=SimpleNamespace(
+            py_type="app.bsky.embed.record#view",
+            record=SimpleNamespace(
+                py_type="app.bsky.embed.record#viewRecord",
+                uri=record_uri,
+                author=SimpleNamespace(handle=record_handle, display_name=record_name),
+                value=SimpleNamespace(text=record_text),
+                embeds=record_embeds or [],
+            ),
+        ),
     )
 
 
@@ -785,3 +848,240 @@ class TestUsernameParameter:
         root = ET.fromstring(resp.text)
         title = root.find("channel/title").text
         assert "custom.bsky.social" in title
+
+
+# ===================================================================
+# 12. Quote post media extraction
+# ===================================================================
+
+
+class TestQuotePostMedia:
+    """extract_media should recurse into quoted post embeds."""
+
+    def test_record_embed_with_inner_images(self):
+        inner_images = _make_image_embed("https://cdn.bsky.app/img/inner.jpg")
+        embed = _make_record_embed(embeds=[inner_images])
+        result = extract_media(embed)
+        assert len(result) == 1
+        assert result[0]["url"] == "https://cdn.bsky.app/img/inner.jpg"
+
+    def test_record_embed_no_inner_embeds(self):
+        embed = _make_record_embed(embeds=[])
+        result = extract_media(embed)
+        assert result == []
+
+    def test_record_with_media_extracts_both_sides(self):
+        """recordWithMedia should extract media from both the media and the quoted post."""
+        outer_images = _make_image_embed("https://cdn.bsky.app/img/outer.jpg")
+        inner_images = _make_image_embed("https://cdn.bsky.app/img/inner.jpg")
+        embed = _make_record_with_media_full_embed(
+            media_embed=outer_images,
+            record_embeds=[inner_images],
+        )
+        result = extract_media(embed)
+        urls = [r["url"] for r in result]
+        assert "https://cdn.bsky.app/img/outer.jpg" in urls
+        assert "https://cdn.bsky.app/img/inner.jpg" in urls
+
+    def test_record_embed_with_inner_video(self):
+        inner_video = _make_video_embed("https://video.bsky.app/inner.m3u8")
+        embed = _make_record_embed(embeds=[inner_video])
+        result = extract_media(embed)
+        assert len(result) == 1
+        assert result[0]["type"] == "video"
+
+
+# ===================================================================
+# 13. extract_external_link unit tests
+# ===================================================================
+
+
+class TestExtractExternalLink:
+    """Unit tests for extracting full external link metadata."""
+
+    def test_none_returns_none(self):
+        assert extract_external_link(None) is None
+
+    def test_external_embed_returns_link_info(self):
+        embed = _make_full_external_embed(
+            uri="https://example.com/article",
+            title="Great Article",
+            description="A summary of the article",
+        )
+        result = extract_external_link(embed)
+        assert result is not None
+        assert result["uri"] == "https://example.com/article"
+        assert result["title"] == "Great Article"
+        assert result["description"] == "A summary of the article"
+
+    def test_external_embed_without_uri_returns_none(self):
+        embed = SimpleNamespace(
+            py_type="app.bsky.embed.external#view",
+            external=SimpleNamespace(uri=None, title="No URL", description="", thumb=None),
+        )
+        assert extract_external_link(embed) is None
+
+    def test_non_external_embed_returns_none(self):
+        embed = _make_image_embed("https://cdn.bsky.app/img/1.jpg")
+        assert extract_external_link(embed) is None
+
+    def test_record_with_media_external_recurses(self):
+        ext = _make_full_external_embed(
+            uri="https://example.com/linked",
+            title="Linked",
+            description="A link",
+        )
+        embed = _make_record_with_media_full_embed(media_embed=ext)
+        result = extract_external_link(embed)
+        assert result is not None
+        assert result["uri"] == "https://example.com/linked"
+
+    def test_old_external_embed_without_uri_attr_returns_none(self):
+        """The original _make_external_embed factory has no .uri — must not crash."""
+        embed = _make_external_embed("https://example.com/og-image.jpg")
+        assert extract_external_link(embed) is None
+
+
+# ===================================================================
+# 14. extract_quote unit tests
+# ===================================================================
+
+
+class TestExtractQuote:
+    """Unit tests for extracting quoted post info."""
+
+    def test_none_returns_none(self):
+        assert extract_quote(None) is None
+
+    def test_record_embed_returns_quote_info(self):
+        embed = _make_record_embed(
+            text="Quoted text",
+            handle="author.bsky.social",
+            display_name="Author",
+            uri="at://did:plc:a/app.bsky.feed.post/q1",
+        )
+        result = extract_quote(embed)
+        assert result is not None
+        assert result["text"] == "Quoted text"
+        assert result["author_handle"] == "author.bsky.social"
+        assert result["author_name"] == "Author"
+        assert "author.bsky.social" in result["url"]
+        assert "q1" in result["url"]
+
+    def test_record_with_media_returns_quote_info(self):
+        images = _make_image_embed("https://cdn.bsky.app/img/1.jpg")
+        embed = _make_record_with_media_full_embed(
+            media_embed=images,
+            record_text="Quoted in RWM",
+            record_handle="rwm.bsky.social",
+            record_name="RWM Author",
+        )
+        result = extract_quote(embed)
+        assert result is not None
+        assert result["text"] == "Quoted in RWM"
+        assert result["author_handle"] == "rwm.bsky.social"
+
+    def test_non_record_embed_returns_none(self):
+        embed = _make_image_embed("https://cdn.bsky.app/img/1.jpg")
+        assert extract_quote(embed) is None
+
+    def test_view_not_found_returns_none(self):
+        embed = SimpleNamespace(
+            py_type="app.bsky.embed.record#view",
+            record=SimpleNamespace(
+                py_type="app.bsky.embed.record#viewNotFound",
+                uri="at://did:plc:gone/app.bsky.feed.post/x",
+            ),
+        )
+        assert extract_quote(embed) is None
+
+    def test_view_blocked_returns_none(self):
+        embed = SimpleNamespace(
+            py_type="app.bsky.embed.record#view",
+            record=SimpleNamespace(
+                py_type="app.bsky.embed.record#viewBlocked",
+                uri="at://did:plc:blocked/app.bsky.feed.post/x",
+            ),
+        )
+        assert extract_quote(embed) is None
+
+
+# ===================================================================
+# 15. Enriched description in RSS output
+# ===================================================================
+
+
+class TestEnrichedDescription:
+    """The description should include external link info and quoted post text."""
+
+    def _items(self, test_client, posts):
+        with patch("main.get_client", return_value=_mock_client_for_fav(posts)):
+            resp = test_client.get("/fav")
+        root = ET.fromstring(resp.text)
+        return root.findall("channel/item")
+
+    def test_plain_post_description_unchanged(self, test_client):
+        """A post with no embeds keeps plain text description."""
+        items = self._items(test_client, [_make_post(text="Just text")])
+        desc = items[0].find("description").text
+        assert desc == "Just text"
+
+    def test_external_link_in_description(self, test_client):
+        embed = _make_full_external_embed(
+            uri="https://example.com/article",
+            title="My Article",
+            description="Article summary",
+        )
+        items = self._items(test_client, [_make_post(text="Check this out", embed=embed)])
+        desc = items[0].find("description").text
+        assert "https://example.com/article" in desc
+        assert "My Article" in desc
+        assert "Article summary" in desc
+        assert "Check this out" in desc
+
+    def test_external_link_without_title_shows_url(self, test_client):
+        embed = _make_full_external_embed(
+            uri="https://example.com/notitle",
+            title="",
+            description="",
+        )
+        items = self._items(test_client, [_make_post(text="Link", embed=embed)])
+        desc = items[0].find("description").text
+        assert "https://example.com/notitle" in desc
+
+    def test_quote_in_description(self, test_client):
+        embed = _make_record_embed(
+            text="Original thought",
+            handle="original.bsky.social",
+            display_name="Original Author",
+        )
+        items = self._items(test_client, [_make_post(text="I agree", embed=embed)])
+        desc = items[0].find("description").text
+        assert "Original thought" in desc
+        assert "Original Author" in desc
+        assert "original.bsky.social" in desc
+        assert "I agree" in desc
+
+    def test_record_with_media_shows_quote_and_link(self, test_client):
+        ext = _make_full_external_embed(
+            uri="https://example.com/shared",
+            title="Shared Link",
+        )
+        embed = _make_record_with_media_full_embed(
+            media_embed=ext,
+            record_text="Interesting find",
+            record_handle="finder.bsky.social",
+            record_name="Finder",
+        )
+        items = self._items(test_client, [_make_post(text="Look!", embed=embed)])
+        desc = items[0].find("description").text
+        assert "https://example.com/shared" in desc
+        assert "Interesting find" in desc
+        assert "Finder" in desc
+
+    def test_image_only_post_keeps_plain_description(self, test_client):
+        """A post with only images (no quote, no external link) stays plain text."""
+        embed = _make_image_embed("https://cdn.bsky.app/img/1.jpg")
+        items = self._items(test_client, [_make_post(text="Nice photo", embed=embed)])
+        desc = items[0].find("description").text
+        assert desc == "Nice photo"

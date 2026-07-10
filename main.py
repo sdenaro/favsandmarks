@@ -2,6 +2,7 @@
 
 import os
 from datetime import datetime, timezone
+from html import escape as html_escape
 from xml.etree.ElementTree import Element, SubElement, tostring
 
 from atproto import Client
@@ -101,8 +102,152 @@ def extract_media(embed) -> list[dict]:
         inner_media = getattr(embed, "media", None)
         if inner_media:
             media.extend(extract_media(inner_media))
+        # Also extract media from the quoted post's embeds
+        inner_record = getattr(embed, "record", None)
+        if inner_record:
+            record_view = getattr(inner_record, "record", None)
+            if record_view:
+                for inner_embed in getattr(record_view, "embeds", []) or []:
+                    media.extend(extract_media(inner_embed))
+
+    # Quote post (no additional media on the outer post)
+    elif py_type == "app.bsky.embed.record#view":
+        record_view = getattr(embed, "record", None)
+        if record_view:
+            for inner_embed in getattr(record_view, "embeds", []) or []:
+                media.extend(extract_media(inner_embed))
 
     return media
+
+
+def extract_external_link(embed) -> dict | None:
+    """Extract external link URL, title, and description from a post embed.
+
+    Returns a dict with ``uri``, ``title``, and ``description`` keys, or
+    *None* when the embed is not (or does not contain) an external link.
+    """
+    if embed is None:
+        return None
+
+    py_type = getattr(embed, "py_type", "") or ""
+
+    if py_type == "app.bsky.embed.external#view":
+        ext = getattr(embed, "external", None)
+        if ext:
+            uri = getattr(ext, "uri", None)
+            if uri:
+                return {
+                    "uri": uri,
+                    "title": getattr(ext, "title", None) or "",
+                    "description": getattr(ext, "description", None) or "",
+                }
+
+    # recordWithMedia may have an external link as its media side
+    if py_type == "app.bsky.embed.recordWithMedia#view":
+        inner_media = getattr(embed, "media", None)
+        if inner_media:
+            return extract_external_link(inner_media)
+
+    return None
+
+
+def extract_quote(embed) -> dict | None:
+    """Extract quoted post text, author, and URL from a record embed.
+
+    Works for both ``app.bsky.embed.record#view`` (pure quote) and
+    ``app.bsky.embed.recordWithMedia#view`` (quote + media).  Returns
+    *None* for any other embed type or when the quoted record is not
+    a viewRecord (e.g. viewNotFound, viewBlocked).
+    """
+    if embed is None:
+        return None
+
+    py_type = getattr(embed, "py_type", "") or ""
+
+    record_view = None
+
+    if py_type == "app.bsky.embed.record#view":
+        record_view = getattr(embed, "record", None)
+    elif py_type == "app.bsky.embed.recordWithMedia#view":
+        inner_record = getattr(embed, "record", None)
+        if inner_record:
+            record_view = getattr(inner_record, "record", None)
+
+    if record_view is None:
+        return None
+
+    # Only process actual viewRecord objects (skip viewNotFound, viewBlocked)
+    rv_type = getattr(record_view, "py_type", "") or ""
+    if rv_type and "viewRecord" not in rv_type:
+        return None
+
+    author = getattr(record_view, "author", None)
+    value = getattr(record_view, "value", None)
+    uri = getattr(record_view, "uri", "")
+
+    author_handle = getattr(author, "handle", "unknown") if author else "unknown"
+    author_name = (
+        getattr(author, "display_name", author_handle) if author else author_handle
+    )
+    text = getattr(value, "text", "") if value else ""
+
+    quote_url = post_uri_to_url(uri, author_handle) if uri else ""
+
+    return {
+        "text": text,
+        "author_handle": author_handle,
+        "author_name": author_name,
+        "url": quote_url,
+    }
+
+
+def _build_description(text: str, embed) -> str:
+    """Build an item description, enriched with external link and quote info.
+
+    When the post has no external link or quote, the plain *text* is
+    returned unchanged (preserving existing behaviour).  Otherwise an
+    HTML string is returned so RSS readers can render clickable links
+    and blockquotes.
+    """
+    ext_link = extract_external_link(embed)
+    quote = extract_quote(embed)
+
+    if not ext_link and not quote:
+        return text
+
+    parts: list[str] = []
+    if text:
+        parts.append(f"<p>{html_escape(text)}</p>")
+
+    if ext_link:
+        uri = html_escape(ext_link["uri"], quote=True)
+        title = html_escape(ext_link["title"]) if ext_link["title"] else ""
+        desc = html_escape(ext_link["description"]) if ext_link["description"] else ""
+        link_html = "<p>\U0001f517 "
+        if title:
+            link_html += f'<a href="{uri}">{title}</a>'
+        else:
+            link_html += f'<a href="{uri}">{html_escape(ext_link["uri"])}</a>'
+        if desc:
+            link_html += f"<br/>{desc}"
+        link_html += "</p>"
+        parts.append(link_html)
+
+    if quote:
+        q_author = html_escape(quote["author_name"])
+        q_handle = html_escape(quote["author_handle"])
+        q_text = html_escape(quote["text"]) if quote["text"] else ""
+        q_url = html_escape(quote["url"], quote=True) if quote["url"] else ""
+        header = f"<strong>{q_author}</strong> (@{q_handle})"
+        if q_url:
+            header = f'<a href="{q_url}">{header}</a>'
+        quote_html = f"<blockquote><p>{header}:</p>"
+        if q_text:
+            quote_html += f"<p>{q_text}</p>"
+        quote_html += "</blockquote>"
+        parts.append(quote_html)
+
+    return "\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +279,7 @@ def build_rss(title: str, description: str, posts: list, handle: str = "") -> st
         text = getattr(record, "text", "") if record else ""
         created_at = getattr(record, "created_at", None) if record else None
         uri = getattr(post, "uri", "")
+        embed = getattr(post, "embed", None)
 
         link = post_uri_to_url(uri, handle)
 
@@ -141,7 +287,7 @@ def build_rss(title: str, description: str, posts: list, handle: str = "") -> st
         SubElement(item, "title").text = f"{display_name}: {text[:100]}"
         SubElement(item, "link").text = link
         SubElement(item, "guid", isPermaLink="true").text = link
-        SubElement(item, "description").text = text
+        SubElement(item, "description").text = _build_description(text, embed)
 
         if created_at:
             try:
@@ -153,7 +299,6 @@ def build_rss(title: str, description: str, posts: list, handle: str = "") -> st
                 pass
 
         # Attach media via Media RSS namespace
-        embed = getattr(post, "embed", None)
         attachments = extract_media(embed)
         for att in attachments:
             SubElement(
