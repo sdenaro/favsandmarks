@@ -8,6 +8,7 @@ A lightweight FastAPI service that exposes your Bluesky likes and bookmarks as R
 - **`/marks`** — Returns your bookmarked posts as an RSS feed
 - **`/combo`** — Returns both likes and bookmarks in a single combined RSS feed (deduplicated)
 - **`?limit=N`** — All feed endpoints accept a `limit` query parameter (1–25) to control how many items are returned
+- **`?username=name`** — All feed endpoints accept a `username` query parameter to handle multiple Bluesky accounts
 - Media attachments (images, video, external link thumbnails) are included via `<enclosure>` and [Media RSS](http://www.rssboard.org/media-rss) tags
 - Authenticates with Bluesky using an app password — no OAuth flow required
 
