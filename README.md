@@ -65,6 +65,10 @@ A lightweight FastAPI service that exposes your Bluesky likes and bookmarks as R
 
    The API is now available at `http://127.0.0.1:8000`.
 
+## Deployment
+
+For running the application continuously or in a production environment (such as on Ubuntu), you can run it as a system service using systemd. For more information and step-by-step instructions on how to set this up, refer to [Deploying a Flask Application with Systemd on Ubuntu](https://medium.com/@ni8hin/deploying-a-flask-application-with-systemd-on-ubuntu-5c767bf2f3b4).
+
 ## Endpoints
 
 | Route | Method | Description |
