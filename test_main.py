@@ -12,7 +12,19 @@ from unittest.mock import MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
-from main import DEFAULT_LIMIT, app, build_rss, extract_external_link, extract_media, extract_quote, get_client
+from main import (
+    DEFAULT_LIMIT,
+    app,
+    build_mastodon_rss,
+    build_rss,
+    clean_html_text,
+    extract_external_link,
+    extract_mastodon_media,
+    extract_media,
+    extract_quote,
+    get_client,
+    get_mastodon_credentials,
+)
 from fastapi import HTTPException
 
 # ---------------------------------------------------------------------------
@@ -1085,3 +1097,179 @@ class TestEnrichedDescription:
         items = self._items(test_client, [_make_post(text="Nice photo", embed=embed)])
         desc = items[0].find("description").text
         assert desc == "Nice photo"
+
+
+# ===================================================================
+# 16. Mastodon Unit & Integration Tests
+# ===================================================================
+
+
+def _make_mastodon_status(
+    *,
+    id="1092837465",
+    content="<p>Hello from Mastodon!</p>",
+    spoiler_text="",
+    username="mastouser",
+    display_name="Masto User",
+    created_at="2025-06-15T12:00:00.000Z",
+    url="https://mastodon.social/@mastouser/1092837465",
+    media_attachments=None,
+):
+    return {
+        "id": id,
+        "content": content,
+        "spoiler_text": spoiler_text,
+        "created_at": created_at,
+        "url": url,
+        "uri": url,
+        "account": {
+            "username": username,
+            "display_name": display_name,
+            "acct": username,
+        },
+        "media_attachments": media_attachments or [],
+    }
+
+
+def _mock_mastodon_helpers(account_info=None, fav_statuses=None, mark_statuses=None):
+    if account_info is None:
+        account_info = {"username": "testuser", "acct": "testuser@mastodon.social"}
+    if fav_statuses is None:
+        fav_statuses = [_make_mastodon_status()]
+    if mark_statuses is None:
+        mark_statuses = [_make_mastodon_status(id="20001", content="<p>Bookmarked toot</p>")]
+
+    def mock_fetch(endpoint, server, token, limit):
+        if "favourites" in endpoint:
+            return fav_statuses[:limit]
+        if "bookmarks" in endpoint:
+            return mark_statuses[:limit]
+        return []
+
+    return (
+        patch("main.get_mastodon_credentials", return_value=("https://mastodon.social", "fake-token")),
+        patch("main.get_mastodon_account", return_value=account_info),
+        patch("main.fetch_mastodon_statuses", side_effect=mock_fetch),
+    )
+
+
+class TestMastodonHelpers:
+    def test_clean_html_text(self):
+        html = "<p>Hello <strong>World</strong> &amp; friends!</p>"
+        cleaned = clean_html_text(html)
+        assert cleaned == "Hello World & friends!"
+
+    def test_extract_mastodon_media_image(self):
+        atts = [{"url": "https://mastodon.social/system/media_attachments/files/000/1.png", "type": "image"}]
+        extracted = extract_mastodon_media(atts)
+        assert len(extracted) == 1
+        assert extracted[0]["mime_type"] == "image/png"
+        assert extracted[0]["type"] == "image"
+
+    def test_extract_mastodon_media_video(self):
+        atts = [{
+            "url": "https://mastodon.social/system/media_attachments/files/000/2.mp4",
+            "type": "video",
+            "preview_url": "https://mastodon.social/system/media_attachments/files/000/2_thumb.jpg",
+        }]
+        extracted = extract_mastodon_media(atts)
+        assert len(extracted) == 1
+        assert extracted[0]["mime_type"] == "video/mp4"
+        assert extracted[0]["type"] == "video"
+        assert extracted[0]["preview_url"] == "https://mastodon.social/system/media_attachments/files/000/2_thumb.jpg"
+
+    def test_get_mastodon_credentials_default(self):
+        env = {
+            "MASTODON_SERVER": "mastodon.social",
+            "MASTODON_ACCESS_TOKEN": "token123",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            server, token = get_mastodon_credentials()
+            assert server == "https://mastodon.social"
+            assert token == "token123"
+
+    def test_get_mastodon_credentials_custom_username(self):
+        env = {
+            "FOO_MASTODON_SERVER": "https://masto.example.com",
+            "FOO_MASTODON_ACCESS_TOKEN": "tokenfoo",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            server, token = get_mastodon_credentials("foo")
+            assert server == "https://masto.example.com"
+            assert token == "tokenfoo"
+
+    def test_get_mastodon_credentials_missing_raises(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with pytest.raises(HTTPException) as exc_info:
+                get_mastodon_credentials()
+            assert exc_info.value.status_code == 500
+
+            with pytest.raises(HTTPException) as exc_info_user:
+                get_mastodon_credentials("unknown")
+            assert exc_info_user.value.status_code == 404
+
+
+class TestMastodonEndpoints:
+    def test_mastodon_fav_endpoint(self, test_client):
+        p_cred, p_acct, p_fetch = _mock_mastodon_helpers()
+        with p_cred, p_acct, p_fetch:
+            resp = test_client.get("/mastodon/fav")
+        assert resp.status_code == 200
+        root = ET.fromstring(resp.text)
+        assert root.tag == "rss"
+        assert root.find("channel/title").text == "Mastodon Favorites — @testuser@mastodon.social"
+        items = root.findall("channel/item")
+        assert len(items) == 1
+
+    def test_mastodon_marks_endpoint(self, test_client):
+        p_cred, p_acct, p_fetch = _mock_mastodon_helpers()
+        with p_cred, p_acct, p_fetch:
+            resp = test_client.get("/mastodon/marks")
+        assert resp.status_code == 200
+        root = ET.fromstring(resp.text)
+        assert root.find("channel/title").text == "Mastodon Bookmarks — @testuser@mastodon.social"
+        items = root.findall("channel/item")
+        assert len(items) == 1
+        assert "Bookmarked toot" in items[0].find("description").text
+
+    def test_mastodon_combo_endpoint(self, test_client):
+        p_cred, p_acct, p_fetch = _mock_mastodon_helpers()
+        with p_cred, p_acct, p_fetch:
+            resp = test_client.get("/mastodon/combo")
+        assert resp.status_code == 200
+        root = ET.fromstring(resp.text)
+        assert root.find("channel/title").text == "Mastodon Favorites & Bookmarks — @testuser@mastodon.social"
+        items = root.findall("channel/item")
+        assert len(items) == 2
+
+    def test_mastodon_combo_deduplication(self, test_client):
+        shared_status = _make_mastodon_status(id="100", content="<p>Shared Toot</p>")
+        p_cred, p_acct, p_fetch = _mock_mastodon_helpers(
+            fav_statuses=[shared_status],
+            mark_statuses=[shared_status],
+        )
+        with p_cred, p_acct, p_fetch:
+            resp = test_client.get("/mastodon/combo")
+        root = ET.fromstring(resp.text)
+        items = root.findall("channel/item")
+        assert len(items) == 1
+
+    def test_mastodon_content_warning(self, test_client):
+        cw_status = _make_mastodon_status(
+            content="<p>Sensitive content</p>",
+            spoiler_text="Spoilers for movie",
+        )
+        p_cred, p_acct, p_fetch = _mock_mastodon_helpers(fav_statuses=[cw_status])
+        with p_cred, p_acct, p_fetch:
+            resp = test_client.get("/mastodon/fav")
+        root = ET.fromstring(resp.text)
+        desc = root.find("channel/item/description").text
+        assert "[CW: Spoilers for movie]" in desc
+
+    def test_root_lists_mastodon_endpoints(self, test_client):
+        resp = test_client.get("/")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "/mastodon/fav" in data["endpoints"]
+        assert "/mastodon/marks" in data["endpoints"]
+        assert "/mastodon/combo" in data["endpoints"]
