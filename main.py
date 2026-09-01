@@ -1,10 +1,12 @@
 """FavsAndMarks — Bluesky likes & bookmarks as RSS feeds."""
 
 import os
+import re
 from datetime import datetime, timezone
-from html import escape as html_escape
+from html import escape as html_escape, unescape as html_unescape
 from xml.etree.ElementTree import Element, SubElement, tostring
 
+import httpx
 from atproto import Client
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
@@ -14,12 +16,187 @@ load_dotenv()
 
 BLUESKY_HANDLE = os.getenv("BLUESKY_HANDLE", "")
 BLUESKY_APP_PASSWORD = os.getenv("BLUESKY_APP_PASSWORD", "")
+MASTODON_SERVER = os.getenv("MASTODON_SERVER", "")
+MASTODON_ACCESS_TOKEN = os.getenv("MASTODON_ACCESS_TOKEN", "")
 DEFAULT_LIMIT = min(max(int(os.getenv("LIMIT", "10")), 1), 25)
 
 app = FastAPI(
     title="FavsAndMarks",
-    description="Bluesky likes and bookmarks served as RSS feeds.",
+    description="Bluesky and Mastodon likes/favorites and bookmarks served as RSS feeds.",
 )
+
+
+def get_mastodon_credentials(username: str | None = None) -> tuple[str, str]:
+    """Retrieve Mastodon server URL and access token.
+
+    When *username* is provided, credentials are read from
+    ``{USERNAME}_MASTODON_SERVER`` and ``{USERNAME}_MASTODON_ACCESS_TOKEN``.
+    Otherwise the default ``MASTODON_SERVER`` / ``MASTODON_ACCESS_TOKEN`` are used.
+    """
+    if username:
+        prefix = username.upper()
+        server = os.getenv(f"{prefix}_MASTODON_SERVER", "")
+        token = os.getenv(f"{prefix}_MASTODON_ACCESS_TOKEN", "")
+        if not server or not token:
+            raise HTTPException(
+                status_code=404,
+                detail=f"{prefix}_MASTODON_SERVER and {prefix}_MASTODON_ACCESS_TOKEN must be set in .env",
+            )
+    else:
+        server = os.getenv("MASTODON_SERVER", MASTODON_SERVER)
+        token = os.getenv("MASTODON_ACCESS_TOKEN", MASTODON_ACCESS_TOKEN)
+        if not server or not token:
+            raise HTTPException(
+                status_code=500,
+                detail="MASTODON_SERVER and MASTODON_ACCESS_TOKEN must be set in .env",
+            )
+    server = server.rstrip("/")
+    if not server.startswith("http://") and not server.startswith("https://"):
+        server = f"https://{server}"
+    return server, token
+
+
+def get_mastodon_account(server: str, token: str) -> dict:
+    """Fetch authenticated Mastodon account info."""
+    url = f"{server}/api/v1/accounts/verify_credentials"
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        response = httpx.get(url, headers=headers, timeout=10.0)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Error verifying Mastodon credentials: {str(e)}",
+        )
+
+
+def fetch_mastodon_statuses(endpoint: str, server: str, token: str, limit: int) -> list[dict]:
+    """Fetch statuses from a Mastodon API endpoint (e.g. /api/v1/favourites)."""
+    url = f"{server}{endpoint}"
+    headers = {"Authorization": f"Bearer {token}"}
+    params = {"limit": limit}
+    try:
+        response = httpx.get(url, headers=headers, params=params, timeout=10.0)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Error fetching data from Mastodon API: {str(e)}",
+        )
+
+
+def clean_html_text(html_content: str) -> str:
+    """Strip HTML tags and unescape HTML entities for title creation."""
+    if not html_content:
+        return ""
+    text = re.sub(r"<[^>]+>", "", html_content)
+    return html_unescape(text).strip()
+
+
+def extract_mastodon_media(media_attachments: list[dict]) -> list[dict]:
+    """Extract media attachments from Mastodon status into {url, mime_type, type, preview_url} dicts."""
+    media: list[dict] = []
+    for att in media_attachments or []:
+        url = att.get("url") or att.get("remote_url")
+        if not url:
+            continue
+        att_type = att.get("type", "image")
+        preview_url = att.get("preview_url")
+
+        if att_type == "image":
+            mime_type = "image/jpeg"
+            if url.lower().endswith(".png"):
+                mime_type = "image/png"
+            elif url.lower().endswith(".gif"):
+                mime_type = "image/gif"
+            elif url.lower().endswith(".webp"):
+                mime_type = "image/webp"
+            media.append({"url": url, "mime_type": mime_type, "type": "image"})
+        elif att_type in ("video", "gifv"):
+            media.append({"url": url, "mime_type": "video/mp4", "type": "video", "preview_url": preview_url})
+        elif att_type == "audio":
+            media.append({"url": url, "mime_type": "audio/mpeg", "type": "audio"})
+        else:
+            media.append({"url": url, "mime_type": "application/octet-stream", "type": "file"})
+    return media
+
+
+def build_mastodon_rss(title: str, description: str, statuses: list[dict], server: str, acct: str) -> str:
+    """Build an RSS 2.0 XML string from a list of Mastodon status dicts."""
+    rss = Element("rss", version="2.0", attrib={
+        "xmlns:atom": "http://www.w3.org/2005/Atom",
+        "xmlns:media": "http://search.yahoo.com/mrss/",
+    })
+    channel = SubElement(rss, "channel")
+    SubElement(channel, "title").text = title
+    SubElement(channel, "description").text = description
+    SubElement(channel, "link").text = f"{server}/@{acct}" if acct else server
+    SubElement(channel, "lastBuildDate").text = datetime.now(timezone.utc).strftime(
+        "%a, %d %b %Y %H:%M:%S +0000"
+    )
+
+    for status in statuses:
+        account = status.get("account") or {}
+        display_name = account.get("display_name") or account.get("username") or "Unknown"
+        raw_content = status.get("content", "")
+        clean_text = clean_html_text(raw_content)
+        created_at = status.get("created_at")
+        link = status.get("url") or status.get("uri", "")
+
+        spoiler_text = status.get("spoiler_text", "")
+        desc_content = raw_content
+        if spoiler_text:
+            desc_content = f"<p><strong>[CW: {html_escape(spoiler_text)}]</strong></p>" + raw_content
+
+        item = SubElement(channel, "item")
+        SubElement(item, "title").text = f"{display_name}: {clean_text[:100]}"
+        SubElement(item, "link").text = link
+        SubElement(item, "guid", isPermaLink="true").text = link
+        SubElement(item, "description").text = desc_content
+
+        if created_at:
+            try:
+                dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                SubElement(item, "pubDate").text = dt.strftime(
+                    "%a, %d %b %Y %H:%M:%S +0000"
+                )
+            except (ValueError, TypeError):
+                pass
+
+        attachments = extract_mastodon_media(status.get("media_attachments", []))
+        for att in attachments:
+            SubElement(
+                item,
+                "enclosure",
+                url=att["url"],
+                type=att["mime_type"],
+                length="0",
+            )
+            medium_attr = "image"
+            if att["type"] == "video":
+                medium_attr = "video"
+            elif att["type"] == "audio":
+                medium_attr = "audio"
+
+            SubElement(
+                item,
+                "media:content",
+                url=att["url"],
+                type=att["mime_type"],
+                medium=medium_attr,
+            )
+            if att.get("preview_url") and att["type"] == "video":
+                SubElement(
+                    item,
+                    "media:thumbnail",
+                    url=att["preview_url"],
+                )
+
+    return '<?xml version="1.0" encoding="UTF-8"?>\n' + tostring(
+        rss, encoding="unicode"
+    )
 
 
 def get_client(username: str | None = None) -> tuple[Client, str]:
@@ -442,14 +619,94 @@ def get_combo(
     return Response(content=rss_xml, media_type="application/rss+xml; charset=utf-8")
 
 
+# ---------------------------------------------------------------------------
+# Mastodon Endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/mastodon/fav", response_class=Response)
+def get_mastodon_favorites(
+    limit: int = Query(default=DEFAULT_LIMIT, ge=1, le=25),
+    username: str | None = Query(default=None),
+):
+    """Return favorited Mastodon posts as RSS."""
+    server, token = get_mastodon_credentials(username)
+    acct_info = get_mastodon_account(server, token)
+    acct = acct_info.get("acct", "")
+    statuses = fetch_mastodon_statuses("/api/v1/favourites", server, token, limit)
+    rss_xml = build_mastodon_rss(
+        title=f"Mastodon Favorites — @{acct}",
+        description=f"Last {limit} favorited posts by @{acct}",
+        statuses=statuses,
+        server=server,
+        acct=acct,
+    )
+    return Response(content=rss_xml, media_type="application/rss+xml; charset=utf-8")
+
+
+@app.get("/mastodon/marks", response_class=Response)
+def get_mastodon_bookmarks(
+    limit: int = Query(default=DEFAULT_LIMIT, ge=1, le=25),
+    username: str | None = Query(default=None),
+):
+    """Return bookmarked Mastodon posts as RSS."""
+    server, token = get_mastodon_credentials(username)
+    acct_info = get_mastodon_account(server, token)
+    acct = acct_info.get("acct", "")
+    statuses = fetch_mastodon_statuses("/api/v1/bookmarks", server, token, limit)
+    rss_xml = build_mastodon_rss(
+        title=f"Mastodon Bookmarks — @{acct}",
+        description=f"Last {limit} bookmarked posts by @{acct}",
+        statuses=statuses,
+        server=server,
+        acct=acct,
+    )
+    return Response(content=rss_xml, media_type="application/rss+xml; charset=utf-8")
+
+
+@app.get("/mastodon/combo", response_class=Response)
+def get_mastodon_combo(
+    limit: int = Query(default=DEFAULT_LIMIT, ge=1, le=25),
+    username: str | None = Query(default=None),
+):
+    """Return both favorited and bookmarked Mastodon posts combined as RSS."""
+    server, token = get_mastodon_credentials(username)
+    acct_info = get_mastodon_account(server, token)
+    acct = acct_info.get("acct", "")
+
+    fav_statuses = fetch_mastodon_statuses("/api/v1/favourites", server, token, limit)
+    mark_statuses = fetch_mastodon_statuses("/api/v1/bookmarks", server, token, limit)
+
+    seen_ids: set = set()
+    combined: list = []
+    for st in fav_statuses + mark_statuses:
+        st_id = st.get("id")
+        if st_id and st_id not in seen_ids:
+            seen_ids.add(st_id)
+            combined.append(st)
+        elif not st_id:
+            combined.append(st)
+
+    rss_xml = build_mastodon_rss(
+        title=f"Mastodon Favorites & Bookmarks — @{acct}",
+        description=f"Last {limit} favorited and bookmarked posts by @{acct}",
+        statuses=combined,
+        server=server,
+        acct=acct,
+    )
+    return Response(content=rss_xml, media_type="application/rss+xml; charset=utf-8")
+
+
 @app.get("/")
 def root():
     """Health check / index."""
     return {
         "app": "FavsAndMarks",
         "endpoints": {
-            "/fav": "Liked posts as RSS (?limit=1..25, ?username=<name>)",
-            "/marks": "Bookmarked posts as RSS (?limit=1..25, ?username=<name>)",
-            "/combo": "Likes & bookmarks combined as RSS (?limit=1..25, ?username=<name>)",
+            "/fav": "Bluesky liked posts as RSS (?limit=1..25, ?username=<name>)",
+            "/marks": "Bluesky bookmarked posts as RSS (?limit=1..25, ?username=<name>)",
+            "/combo": "Bluesky likes & bookmarks combined as RSS (?limit=1..25, ?username=<name>)",
+            "/mastodon/fav": "Mastodon favorited posts as RSS (?limit=1..25, ?username=<name>)",
+            "/mastodon/marks": "Mastodon bookmarked posts as RSS (?limit=1..25, ?username=<name>)",
+            "/mastodon/combo": "Mastodon favorites & bookmarks combined as RSS (?limit=1..25, ?username=<name>)",
         },
     }
